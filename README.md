@@ -1,8 +1,10 @@
-Demo project: AI-powered secure CI/CD pipeline on AWS.
-- Minimal Flask app with an intentional insecure SQL pattern.
-- Dockerized app.
-- AWS CodePipeline + CodeBuild skeleton.
-- Lambda-based AI suggestion step (later).
+# Intelligent-DevSecOps-AI-Pipeline
 
-See /docs for demo script and architecture.
-# test
+## What
+Minimal demo: push -> CodePipeline -> CodeBuild runs build (and later scans). App is a Flask app with an intentional SQL injection vulnerability.
+
+## Quick run
+1. `git clone ...`
+2. `python -m venv venv && source venv/bin/activate`
+3. `pip install -r requirements.txt`
+4. `python app.py`
