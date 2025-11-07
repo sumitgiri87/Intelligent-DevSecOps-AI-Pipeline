@@ -5,12 +5,15 @@ phases:
     runtime-versions:
       python: 3.10
     commands:
-      - pip install bandit
+      - echo "Installing tools"
+      - pip install bandit==1.8.6 pytest
       - echo "Installing Trivy"
       - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.18.3
+
   pre_build:
     commands:
       - echo "Starting build"
+
   build:
     commands:
       - echo "Running unit tests"
@@ -20,9 +23,10 @@ phases:
       - echo "Building docker image"
       - docker build -t sample-app:latest .
       - echo "Scanning image with Trivy"
-      - trivy image --quiet --format json -o trivy-report.json sample-app:latest || true
+      - trivy image --format json --output trivy-report.json --no-progress sample-app:latest || true
 
 artifacts:
   files:
     - bandit-report.json
     - trivy-report.json
+
