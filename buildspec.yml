@@ -5,25 +5,22 @@ phases:
     runtime-versions:
       python: 3.10
     commands:
-      - echo "Installing tools"
-      - pip install bandit==1.7.5 pytest || true
-      # Install trivy via apt (works on CodeBuild standard images)
-      - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.42.0 || true
+      - pip install bandit trivy
   pre_build:
     commands:
-      - echo "Pre-build: preparing"
-      - mkdir -p reports
+      - echo "Starting build"
   build:
     commands:
-      - echo "Run unit tests (if any)"
+      - echo "Running unit tests"
       - pytest -q || true
       - echo "Running Bandit static scan"
-      - bandit -r . -f json -o reports/bandit-report.json || true
+      - bandit -r . -f json -o bandit-report.json || true
       - echo "Building docker image"
-      - docker build -t demo-app:latest . || true
+      - docker build -t sample-app:latest .
       - echo "Scanning image with Trivy"
-      - trivy image --quiet --format json -o reports/trivy-report.json demo-app:latest || true
+      - trivy image --quiet --format json -o trivy-report.json sample-app:latest || true
+
 artifacts:
   files:
-    - reports/bandit-report.json
-    - reports/trivy-report.json
+    - bandit-report.json
+    - trivy-report.json
