@@ -5,7 +5,9 @@ phases:
     runtime-versions:
       python: 3.10
     commands:
-      - pip install bandit trivy
+      - pip install bandit
+      - echo "Installing Trivy"
+      - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.18.3
   pre_build:
     commands:
       - echo "Starting build"
