@@ -29,4 +29,6 @@ artifacts:
   files:
     - bandit-report.json
     - trivy-report.json
+  name: reports/$CODEBUILD_BUILD_NUMBER/
+  discard-paths: yes
 
