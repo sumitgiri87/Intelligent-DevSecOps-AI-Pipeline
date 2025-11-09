@@ -8,6 +8,9 @@ import zipfile
 SSM = boto3.client("ssm", region_name="ca-central-1")
 S3 = boto3.client("s3", region_name="ca-central-1")
 
+# Hardcoded bucket (safe for demo)
+bucket = "codepipeline-ca-central-1-aba92722848d-4a2c-90d2-bc52c59a32aa"
+
 def get_slack_webhook():
     name = os.environ.get("SLACK_SSM_PARAM", "/devsecops/slack_webhook")
     res = SSM.get_parameter(Name=name, WithDecryption=True)
@@ -52,7 +55,7 @@ def parse_trivy(trivy_json):
         return {"error": str(e)}
 
 def lambda_handler(event, context):
-    bucket = event.get("bucket")
+#    bucket = event.get("bucket")
     if not bucket:
         post_slack(":warning: Lambda invoked without bucket")
         return {"status": "bad-request"}
