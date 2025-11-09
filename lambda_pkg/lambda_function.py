@@ -1,24 +1,23 @@
 import os
+import io
 import json
 import boto3
 import requests
+import zipfile
 
 SSM = boto3.client("ssm", region_name="ca-central-1")
 S3 = boto3.client("s3", region_name="ca-central-1")
 
 def get_slack_webhook():
-    """Fetch Slack webhook from SSM."""
     name = os.environ.get("SLACK_SSM_PARAM", "/devsecops/slack_webhook")
     res = SSM.get_parameter(Name=name, WithDecryption=True)
     return res["Parameter"]["Value"]
 
 def post_slack(text):
-    """Send message to Slack."""
     webhook = get_slack_webhook()
     requests.post(webhook, json={"text": text})
 
 def parse_bandit(bandit_json):
-    """Parse Bandit report JSON and return top finding."""
     try:
         data = json.loads(bandit_json)
         results = data.get("results", [])
@@ -35,90 +34,95 @@ def parse_bandit(bandit_json):
         return {"error": str(e)}
 
 def parse_trivy(trivy_json):
-    """Parse Trivy report JSON and summarize vulnerabilities."""
     try:
         data = json.loads(trivy_json)
-        vulnerabilities = []
-        for result in data.get("Results", []):
-            for vuln in result.get("Vulnerabilities", []):
-                vulnerabilities.append({
-                    "pkg": vuln.get("PkgName", ""),
-                    "severity": vuln.get("Severity", ""),
-                    "title": vuln.get("Title", ""),
-                    "version": vuln.get("InstalledVersion", "")
+        results = data.get("Results", [])
+        findings = []
+        for res in results:
+            for vuln in res.get("Vulnerabilities", []):
+                findings.append({
+                    "Target": res.get("Target"),
+                    "PkgName": vuln.get("PkgName"),
+                    "VulnerabilityID": vuln.get("VulnerabilityID"),
+                    "Severity": vuln.get("Severity"),
+                    "Description": vuln.get("Description")
                 })
-        return vulnerabilities if vulnerabilities else None
+        return findings if findings else None
     except Exception as e:
         return {"error": str(e)}
 
 def lambda_handler(event, context):
     bucket = event.get("bucket")
-    prefix = "intelligent-devsecop/BuildArtif/"
-
     if not bucket:
-        post_slack(":warning: ai-suggester invoked without bucket")
+        post_slack(":warning: Lambda invoked without bucket")
         return {"status": "bad-request"}
 
-    # List all folders in BuildArtif/
-    resp = S3.list_objects_v2(Bucket=bucket, Prefix=prefix, Delimiter='/')
-    folders = [x['Prefix'] for x in resp.get('CommonPrefixes', [])]
+    # List all objects under BuildArtif/
+    resp = S3.list_objects_v2(Bucket=bucket, Prefix="intelligent-devsecop/BuildArtif/")
+    objects = resp.get("Contents", [])
 
-    if not folders:
-        post_slack(":warning: No folders found in BuildArtif/")
-        return {"status": "no-folders"}
+    if not objects:
+        post_slack(":warning: No objects found in BuildArtif/")
+        return {"status": "no-objects"}
 
-    # Pick the latest folder
-    latest_folder = sorted(folders, reverse=True)[0]
+    # Get the latest uploaded artifact
+    latest_obj = sorted(objects, key=lambda x: x['LastModified'], reverse=True)[0]
+    latest_key = latest_obj['Key']
 
-    # Construct keys for reports
-    bandit_key = f"{latest_folder}bandit-report.json"
-    trivy_key = f"{latest_folder}trivy-report.json"
+    # Download the latest artifact
+    obj = S3.get_object(Bucket=bucket, Key=latest_key)
+    obj_bytes = io.BytesIO(obj['Body'].read())
 
-    # Fetch Bandit report
+    # Try to open as zip
     try:
-        obj = S3.get_object(Bucket=bucket, Key=bandit_key)
-        bandit_json = obj["Body"].read().decode("utf-8")
-        bandit_parsed = parse_bandit(bandit_json)
-    except S3.exceptions.NoSuchKey:
-        bandit_parsed = None
+        with zipfile.ZipFile(obj_bytes) as z:
+            # Find Bandit or Trivy report inside zip
+            report_file = None
+            for f in z.namelist():
+                if f.endswith(("bandit-report.json", "trivy-report.json")):
+                    report_file = f
+                    break
 
-    # Fetch Trivy report
-    try:
-        obj = S3.get_object(Bucket=bucket, Key=trivy_key)
-        trivy_json = obj["Body"].read().decode("utf-8")
-        trivy_parsed = parse_trivy(trivy_json)
-    except S3.exceptions.NoSuchKey:
-        trivy_parsed = None
+            if not report_file:
+                post_slack(f":warning: No Bandit or Trivy reports found inside latest artifact {latest_key}")
+                return {"status": "no-reports"}
 
-    # Build Slack message
-    slack_msg = f"*Latest Build Folder*: {latest_folder}\n"
+            with z.open(report_file) as report:
+                report_content = report.read().decode("utf-8")
 
-    if bandit_parsed:
-        slack_msg += (
-            f"\n*Bandit Findings*\n"
-            f"Vulnerability: {bandit_parsed.get('issue_text')}\n"
-            f"File: {bandit_parsed.get('filename')}:{bandit_parsed.get('line')}\n"
+    except zipfile.BadZipFile:
+        post_slack(f":warning: Latest artifact {latest_key} is not a zip file")
+        return {"status": "not-zip"}
+
+    # Parse Bandit report
+    if report_file.endswith("bandit-report.json"):
+        parsed = parse_bandit(report_content)
+        if not parsed:
+            post_slack(":white_check_mark: No Bandit findings")
+            return {"status": "no-findings"}
+
+        issue = parsed.get('issue_text', '')
+        suggestion = "Use parameterized queries if this is SQL-related." \
+                     if "SQL" in issue or "sql" in issue else \
+                     f"Review finding: {parsed.get('issue_text')} (File: {parsed.get('filename')}:{parsed.get('line')})"
+
+        slack_text = (
+            f"*[Bandit]* Vulnerability: {parsed.get('issue_text')}\n"
+            f"File: {parsed.get('filename')}:{parsed.get('line')}\n"
+            f"Suggestion: {suggestion}"
         )
-        if "SQL" in bandit_parsed.get('issue_text', ""):
-            slack_msg += "Suggestion: Use parameterized queries; avoid formatting SQL strings with user input.\n"
-        else:
-            slack_msg += f"Suggestion: Review finding.\n"
-    else:
-        slack_msg += "\n:white_check_mark: No Bandit findings\n"
 
-    if trivy_parsed:
-        slack_msg += "\n*Trivy Findings*\n"
-        for vuln in trivy_parsed[:5]:  # limit to top 5 for Slack
-            slack_msg += (
-                f"{vuln.get('pkg')} ({vuln.get('version')}): {vuln.get('severity')} - {vuln.get('title')}\n"
-            )
-        if len(trivy_parsed) > 5:
-            slack_msg += f"...and {len(trivy_parsed)-5} more vulnerabilities\n"
-    else:
-        slack_msg += "\n:white_check_mark: No Trivy findings\n"
+    # Parse Trivy report
+    elif report_file.endswith("trivy-report.json"):
+        parsed = parse_trivy(report_content)
+        if not parsed:
+            post_slack(":white_check_mark: No Trivy findings")
+            return {"status": "no-findings"}
 
-    post_slack(slack_msg)
+        slack_text = "*[Trivy]* Vulnerabilities Found:\n"
+        for v in parsed[:5]:  # Limit to first 5 for brevity
+            slack_text += f"- {v['VulnerabilityID']} ({v['Severity']}) in {v['PkgName']} - Target: {v['Target']}\n"
 
-    return {"status": "notified", "folder": latest_folder}
-
+    post_slack(slack_text)
+    return {"status": "notified", "latest_report": latest_key}
 
