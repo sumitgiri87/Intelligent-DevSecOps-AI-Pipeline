@@ -76,23 +76,48 @@ def parse_bandit(bandit_json):
         return {"error": str(e)}
 
 def parse_trivy(trivy_json):
-#   """Extract all vulnerabilities from a Trivy JSON report."""
+    """
+    Extract all vulnerabilities from a Trivy JSON report.
+    Handles both image scans with or without "Results" key.
+    """
     try:
         data = json.loads(trivy_json)
-        results = data.get("Results", [])
-        findings = []
-        for res in results:
-            for vuln in res.get("Vulnerabilities", []):
-                findings.append({
-                    "Target": res.get("Target"),
-                    "PkgName": vuln.get("PkgName"),
-                    "VulnerabilityID": vuln.get("VulnerabilityID"),
-                    "Severity": vuln.get("Severity"),
-                    "Description": vuln.get("Description")
-                })
-        return findings if findings else None
+        
+        # Case 1: Output is list (common for empty scans)
+        if isinstance(data, list):
+            findings = []
+            for item in data:
+                vulns = item.get("Vulnerabilities", [])
+                for v in vulns:
+                    findings.append({
+                        "Target": item.get("Target"),
+                        "PkgName": v.get("PkgName"),
+                        "VulnerabilityID": v.get("VulnerabilityID"),
+                        "Severity": v.get("Severity"),
+                        "Description": v.get("Description")
+                    })
+            return findings
+
+        # Case 2: Output is dict (legacy Trivy JSON with "Results")
+        if isinstance(data, dict):
+            results = data.get("Results", [])
+            findings = []
+            for res in results:
+                for vuln in res.get("Vulnerabilities", []):
+                    findings.append({
+                        "Target": res.get("Target"),
+                        "PkgName": vuln.get("PkgName"),
+                        "VulnerabilityID": vuln.get("VulnerabilityID"),
+                        "Severity": vuln.get("Severity"),
+                        "Description": vuln.get("Description")
+                    })
+            return findings
+
+        # Fallback: empty
+        return None
     except Exception as e:
         return {"error": str(e)}
+
     
 # ----------------------
 # AI Summarization Functions
@@ -155,70 +180,81 @@ def lambda_handler(event, context):
                 CODEPIPELINE.put_job_failure_result(jobId=job_id,
                     failureDetails={"message": "No objects found", "type": "JobFailed"})
             return {"status": "no-objects"}
+
         # Get the most recent artifact
         latest_obj = sorted(objects, key=lambda x: x['LastModified'], reverse=True)[0]
         latest_key = latest_obj['Key']
 
         obj = S3.get_object(Bucket=bucket, Key=latest_key)
         obj_bytes = io.BytesIO(obj['Body'].read())
-        # Open the zip and find the report file
-        with zipfile.ZipFile(obj_bytes) as z:
-            report_file = next((f for f in z.namelist() if f.endswith(("bandit-report.json", "trivy-report.json"))), None)
 
-            if not report_file:
+        # Open the zip and find all report files
+        with zipfile.ZipFile(obj_bytes) as z:
+            report_files = [f for f in z.namelist() if f.endswith(("bandit-report.json", "trivy-report.json"))]
+
+            if not report_files:
                 post_slack(f":warning: No Bandit or Trivy reports found in {latest_key}")
                 if job_id:
                     CODEPIPELINE.put_job_failure_result(jobId=job_id,
                         failureDetails={"message": "No reports found", "type": "JobFailed"})
                 return {"status": "no-reports"}
 
-            with z.open(report_file) as report:
-                report_content = report.read().decode("utf-8")
+            # Iterate over all reports
+            for report_file in report_files:
+                with z.open(report_file) as report:
+                    report_content = report.read().decode("utf-8")
 
-        # Deterministically parse report and format Slack message
-        slack_text = ""
-        if report_file.endswith("bandit-report.json"):
-            parsed = parse_bandit(report_content)
-            if not parsed:
-                slack_text = ":white_check_mark: No Bandit findings"
-            else:
-                issue = parsed.get('issue_text', '')
-                suggestion = ("Use parameterized queries if this is SQL-related."
-                              if "SQL" in issue or "sql" in issue else
-                              f"Review finding: {issue} (File: {parsed.get('filename')}:{parsed.get('line')})")
-                slack_text = f"*[Bandit]* Vulnerability: {issue}\nFile: {parsed.get('filename')}:{parsed.get('line')}\nSuggestion: {suggestion}"
+                # Deterministically parse report and format Slack message
+                slack_text = ""
+                if report_file.endswith("bandit-report.json"):
+                    parsed = parse_bandit(report_content)
+                    if not parsed:
+                        slack_text = ":white_check_mark: No Bandit findings"
+                    else:
+                        issue = parsed.get('issue_text', '')
+                        suggestion = ("Use parameterized queries if this is SQL-related."
+                                      if "SQL" in issue or "sql" in issue else
+                                      f"Review finding: {issue} (File: {parsed.get('filename')}:{parsed.get('line')})")
+                        slack_text = f"*[Bandit]* Vulnerability: {issue}\nFile: {parsed.get('filename')}:{parsed.get('line')}\nSuggestion: {suggestion}"
 
-        elif report_file.endswith("trivy-report.json"):
-            parsed = parse_trivy(report_content)
-            if not parsed:
-                slack_text = ":white_check_mark: No Trivy findings"
-            else:
-                slack_text = "*[Trivy]* Vulnerabilities Found:\n"
-                for v in parsed[:5]:
-                    slack_text += f"- {v['VulnerabilityID']} ({v['Severity']}) in {v['PkgName']} - Target: {v['Target']}\n"
-        # Post raw findings to Slack
-        post_slack(slack_text)
+                elif report_file.endswith("trivy-report.json"):
+                    parsed = parse_trivy(report_content)
 
-         # Summarize using GPT
-        if report_file.endswith("bandit-report.json") or report_file.endswith("trivy-report.json"):
-            try:
-                summary = summarize_vulnerabilities_with_gpt(report_content)
-                post_slack(summary)
-            except openai.RateLimitError:
-                post_slack(":warning: GPT summarization skipped due to insufficient quota.")
-            except openai.InvalidRequestError as e:
-                post_slack(f":x: GPT summarization invalid request: {e}")
-            except Exception as e:
-                post_slack(f":x: GPT summarization failed: {e}")
+                    # Handle: None, {}, [], {"error": "..."}
+                    if not parsed or isinstance(parsed, dict):
+                        slack_text = ":white_check_mark: No Trivy findings"
+                    else:
+                        slack_text = "*[Trivy]* Vulnerabilities Found:\n"
+                        top5 = parsed[:5]
+                        for v in top5:
+                            slack_text += (
+                                f"- {v.get('VulnerabilityID')} ({v.get('Severity')}) "
+                                f"in {v.get('PkgName')} - Target: {v.get('Target')}\n"
+                            )
 
-        # Summarize using Claude
-        if report_file.endswith("bandit-report.json") or report_file.endswith("trivy-report.json"):
-            try:
-                summary = summarize_vulnerabilities_with_claude(report_content) 
-                post_slack(summary)
-            except Exception as e:
-                post_slack(f":x: Summarization failed: {e}")
-       
+                # Post raw findings to Slack
+                post_slack(slack_text)
+
+                # Summarize using GPT
+                if report_file.endswith("bandit-report.json") or report_file.endswith("trivy-report.json"):
+                    try:
+                        summary = summarize_vulnerabilities_with_gpt(report_content)
+                        post_slack(summary)
+                    except openai.RateLimitError:
+                        post_slack(":warning: GPT summarization skipped due to insufficient quota.")
+                    except openai.InvalidRequestError as e:
+                        post_slack(f":x: GPT summarization invalid request: {e}")
+                    except Exception as e:
+                        post_slack(f":x: GPT summarization failed: {e}")
+
+                 # Summarize using Claude
+                if report_file.endswith("bandit-report.json") or report_file.endswith("trivy-report.json"):
+                    try:
+                        summary = summarize_vulnerabilities_with_claude(report_content) 
+                        post_slack(summary)
+                    except Exception as e:
+                        post_slack(f":x: Summarization failed: {e}")
+
         # Report success to CodePipeline
         if job_id:
             CODEPIPELINE.put_job_success_result(jobId=job_id)
