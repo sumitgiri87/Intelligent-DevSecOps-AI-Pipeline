@@ -211,11 +211,30 @@ def lambda_handler(event, context):
                     if not parsed:
                         slack_text = ":white_check_mark: No Bandit findings"
                     else:
+
                         issue = parsed.get('issue_text', '')
                         suggestion = ("Use parameterized queries if this is SQL-related."
                                       if "SQL" in issue or "sql" in issue else
                                       f"Review finding: {issue} (File: {parsed.get('filename')}:{parsed.get('line')})")
                         slack_text = f"*[Bandit]* Vulnerability: {issue}\nFile: {parsed.get('filename')}:{parsed.get('line')}\nSuggestion: {suggestion}"
+
+                    # Summarize using GPT
+                        try:
+                            summary = summarize_vulnerabilities_with_gpt(parsed)
+                            post_slack(summary)
+                        except openai.RateLimitError:
+                            post_slack(":warning: GPT summarization skipped due to insufficient quota.")
+                        except openai.InvalidRequestError as e:
+                            post_slack(f":x: GPT summarization invalid request: {e}")
+                        except Exception as e:
+                            post_slack(f":x: GPT summarization failed: {e}")
+
+                #  # Summarize using Claude
+                        try:
+                            summary = summarize_vulnerabilities_with_claude(parsed)
+                            post_slack(summary)
+                        except Exception as e:
+                            post_slack(f":x: Summarization failed: {e}")
 
                 elif report_file.endswith("trivy-report.json"):
                     parsed = parse_trivy(report_content)
@@ -232,28 +251,20 @@ def lambda_handler(event, context):
                                 f"in {v.get('PkgName')} - Target: {v.get('Target')}\n"
                             )
 
+                        # Summarize using GPT
+                        try:
+                            summary = summarize_vulnerabilities_with_gpt(parsed)
+                            post_slack(summary)
+                        except openai.RateLimitError:
+                            post_slack(":warning: GPT summarization skipped due to insufficient quota.")
+                        except openai.InvalidRequestError as e:
+                            post_slack(f":x: GPT summarization invalid request: {e}")
+                        except Exception as e:
+                            post_slack(f":x: GPT summarization failed: {e}")
+
+
                 # Post raw findings to Slack
                 post_slack(slack_text)
-
-                # Summarize using GPT
-                if report_file.endswith("bandit-report.json") or report_file.endswith("trivy-report.json"):
-                    try:
-                        summary = summarize_vulnerabilities_with_gpt(report_content)
-                        post_slack(summary)
-                    except openai.RateLimitError:
-                        post_slack(":warning: GPT summarization skipped due to insufficient quota.")
-                    except openai.InvalidRequestError as e:
-                        post_slack(f":x: GPT summarization invalid request: {e}")
-                    except Exception as e:
-                        post_slack(f":x: GPT summarization failed: {e}")
-
-                 # Summarize using Claude
-                if report_file.endswith("bandit-report.json") or report_file.endswith("trivy-report.json"):
-                    try:
-                        summary = summarize_vulnerabilities_with_claude(report_content) 
-                        post_slack(summary)
-                    except Exception as e:
-                        post_slack(f":x: Summarization failed: {e}")
 
         # Report success to CodePipeline
         if job_id:
